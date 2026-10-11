@@ -10,37 +10,46 @@ import functools
 import logging
 import time
 import threading
-from typing import Optional, Tuple
+from typing import Optional
 
-# ensure api/ is on path for checkout_engine
 sys.path.insert(0, os.path.dirname(__file__))
 
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+_IMPORT_ERR = None
+run_checkout_for_card = None
+normalize_proxy = None
+parse_card_entry = None
+
 try:
     from checkout_engine import run_checkout_for_card, normalize_proxy, parse_card_entry
+except ImportError as e:
+    _IMPORT_ERR = f"ImportError: {e}"
 except Exception as e:
-    run_checkout_for_card = None
-    normalize_proxy = None
-    parse_card_entry = None
-    _IMPORT_ERR = str(e)
-else:
-    _IMPORT_ERR = None
+    _IMPORT_ERR = f"Exception: {e}"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("darkcarderapi")
 
 WATERMARK = "darkcarderapi"
-THREAD_WORKERS = int(os.environ.get("CHECKER_THREADS", "20"))
+THREAD_WORKERS = int(os.environ.get("CHECKER_THREADS", "10"))
 MAX_RETRIES = int(os.environ.get("CHECKER_RETRIES", "1"))
 
-_pool = concurrent.futures.ThreadPoolExecutor(max_workers=THREAD_WORKERS, thread_name_prefix="chk")
+_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=THREAD_WORKERS,
+    thread_name_prefix="chk"
+)
 _active = 0
 _lock = threading.Lock()
 
-app = FastAPI(title="darkcarderapi", version="1.0.0", docs_url="/docs", redoc_url=None)
+app = FastAPI(
+    title="darkcarderapi",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url=None,
+)
 
 
 def _stamp(d: dict) -> dict:
@@ -61,7 +70,6 @@ class CheckBody(BaseModel):
 
 
 def _norm_proxy(raw: str) -> str:
-    """Optional proxy. Empty string = direct (no proxy)."""
     if not raw or not str(raw).strip():
         return ""
     if normalize_proxy:
@@ -70,7 +78,7 @@ def _norm_proxy(raw: str) -> str:
         except Exception:
             pass
     p = str(raw).strip()
-    if p.startswith("http://") or p.startswith("https://") or p.startswith("socks"):
+    if p.startswith(("http://", "https://", "socks4://", "socks5://")):
         return p
     parts = p.split(":")
     if len(parts) == 4:
@@ -83,16 +91,18 @@ def _norm_proxy(raw: str) -> str:
 
 def _run_sync(shop_url: str, card: str, proxy: str, low: bool) -> dict:
     if run_checkout_for_card is None:
-        return {
-            "Response": "ERROR",
+        return _stamp({
+            "Response": "ENGINE_MISSING",
             "Status": False,
             "Gateway": "Shopify",
             "Price": "-",
             "cc": card,
-            "error": f"engine import failed: {_IMPORT_ERR}",
-            "retryable": True,
-        }
-    last = None
+            "Site": shop_url,
+            "error": f"checkout_engine not loaded — {_IMPORT_ERR}",
+            "retryable": False,
+        })
+
+    last_err = None
     for attempt in range(MAX_RETRIES + 1):
         try:
             result = run_checkout_for_card(
@@ -101,7 +111,7 @@ def _run_sync(shop_url: str, card: str, proxy: str, low: bool) -> dict:
                 proxy_url=proxy,
                 low=low,
             )
-            # CheckResult dataclass / object
+
             if isinstance(result, dict):
                 data = result
             else:
@@ -124,32 +134,31 @@ def _run_sync(shop_url: str, card: str, proxy: str, low: bool) -> dict:
             err = str(data.get("error") or "")
             retryable = bool(data.get("retryable", False))
 
-            charged = status in ("CHARGED", "SUCCESS") or "ORDER_PLACED" in status_code.upper() or "CHARGED" in status_code.upper()
+            charged = (
+                status in ("CHARGED", "SUCCESS")
+                or "ORDER_PLACED" in status_code.upper()
+                or "CHARGED" in status_code.upper()
+            )
             approved = status in ("APPROVED", "LIVE") or any(
                 x in status_code.upper() for x in ("OTP", "3DS", "INSUFFICIENT")
             )
             declined = status in ("DECLINED", "DEAD") or "DECLINED" in status_code.upper()
 
             if charged:
-                resp_txt, st_bool = "ORDER_PLACED", True
-                gate_status = "Live"
+                resp_txt, st_bool, gate_status = "ORDER_PLACED", True, "Live"
             elif approved:
-                resp_txt, st_bool = status_code or "APPROVED", True
-                gate_status = "Live"
+                resp_txt, st_bool, gate_status = status_code or "APPROVED", True, "Live"
             elif declined:
-                resp_txt, st_bool = status_code or "CARD_DECLINED", False
-                gate_status = False
+                resp_txt, st_bool, gate_status = status_code or "CARD_DECLINED", False, False
             else:
-                resp_txt, st_bool = status_code or status or "ERROR", False
-                gate_status = False
+                resp_txt, st_bool, gate_status = status_code or status or "ERROR", False, False
                 if retryable and attempt < MAX_RETRIES:
                     time.sleep(0.3)
                     continue
 
-            # Classify proxy failures from engine error text
             elow = (err or "").lower()
             if any(x in elow for x in ("402", "connect tunnel", "curl: (7)", "tunnel failed", "proxy error")):
-                return {
+                return _stamp({
                     "Response": "PROXY_ERROR",
                     "RawResponse": status_code or "PROXY_ERROR",
                     "Status": False,
@@ -157,11 +166,12 @@ def _run_sync(shop_url: str, card: str, proxy: str, low: bool) -> dict:
                     "Price": "-",
                     "cc": card,
                     "Site": shop_url,
-                    "error": "Proxy dead/402 — use fresh proxy or call without proxy",
+                    "error": "Proxy dead/402 — use fresh proxy or omit proxy",
                     "retryable": True,
                     "receipt_url": "",
-                }
-            return {
+                })
+
+            return _stamp({
                 "Response": resp_txt,
                 "RawResponse": status_code,
                 "Status": gate_status if isinstance(gate_status, str) else st_bool,
@@ -172,42 +182,46 @@ def _run_sync(shop_url: str, card: str, proxy: str, low: bool) -> dict:
                 "error": err,
                 "retryable": retryable and not (charged or approved or declined),
                 "receipt_url": data.get("receipt_url") or "",
-            }
+            })
+
         except Exception as e:
-            last = str(e)[:300]
-            low = last.lower()
+            last_err = str(e)[:300]
+            elow = last_err.lower()
             if attempt < MAX_RETRIES:
                 time.sleep(0.2)
                 continue
-            # Clear proxy-dead messages
-            if any(x in low for x in ("402", "connect tunnel", "proxy", "curl: (7)", "curl: (56)", "tunnel failed")):
-                return {
+            if any(x in elow for x in ("402", "connect tunnel", "proxy", "curl: (7)", "curl: (56)", "tunnel failed")):
+                return _stamp({
                     "Response": "PROXY_ERROR",
                     "Status": False,
                     "Gateway": "Shopify",
                     "Price": "-",
                     "cc": card,
+                    "Site": shop_url,
                     "error": "Proxy dead/402 — use fresh proxy or omit proxy",
                     "retryable": True,
-                }
-            return {
+                })
+            return _stamp({
                 "Response": "ERROR",
                 "Status": False,
                 "Gateway": "Shopify",
                 "Price": "-",
                 "cc": card,
-                "error": last,
+                "Site": shop_url,
+                "error": last_err,
                 "retryable": True,
-            }
-    return {
+            })
+
+    return _stamp({
         "Response": "ERROR",
         "Status": False,
         "Gateway": "Shopify",
         "Price": "-",
         "cc": card,
-        "error": last or "unknown",
+        "Site": shop_url,
+        "error": last_err or "unknown",
         "retryable": True,
-    }
+    })
 
 
 async def _run_check(shop_url: str, card: str, proxy: str, low: bool) -> dict:
@@ -217,9 +231,10 @@ async def _run_check(shop_url: str, card: str, proxy: str, low: bool) -> dict:
     try:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            _pool, functools.partial(_run_sync, shop_url, card, proxy, low)
+            _pool,
+            functools.partial(_run_sync, shop_url, card, proxy, low)
         )
-        return _stamp(result)
+        return result
     finally:
         with _lock:
             _active -= 1
@@ -230,6 +245,7 @@ async def root():
     return _stamp({
         "ok": True,
         "service": "darkcarderapi",
+        "engine": "ok" if run_checkout_for_card else f"fail:{_IMPORT_ERR}",
         "endpoints": ["/shopify", "/check", "/health", "/status"],
     })
 
@@ -250,40 +266,50 @@ async def health():
 
 @app.get("/shopify")
 async def shopify_get(
-    cc: str = Query(None, description="card number|mm|yy|cvv"),
+    cc: str = Query(None, description="card|mm|yy|cvv"),
     card: str = Query(None),
     site: str = Query(None, description="shopify store url"),
     url: str = Query(None),
     proxy: str = Query(None),
     low: str = Query("true"),
 ):
-    """Bot-compatible: /shopify?cc=...&site=...&proxy=..."""
     card_val = (cc or card or "").strip()
     site_val = (site or url or "").strip()
     if not card_val:
-        return JSONResponse(_stamp({"Response": "ERROR", "Status": False, "error": "cc required", "Gateway": "Shopify", "Price": "-"}))
+        return JSONResponse(status_code=400, content=_stamp({
+            "Response": "ERROR", "Status": False,
+            "error": "cc/card required", "Gateway": "Shopify", "Price": "-",
+        }))
     if not site_val:
-        return JSONResponse(_stamp({"Response": "ERROR", "Status": False, "error": "site required", "Gateway": "Shopify", "Price": "-", "cc": card_val}))
+        return JSONResponse(status_code=400, content=_stamp({
+            "Response": "ERROR", "Status": False,
+            "error": "site/url required", "Gateway": "Shopify",
+            "Price": "-", "cc": card_val,
+        }))
     if not site_val.startswith("http"):
         site_val = "https://" + site_val
     proxy_val = _norm_proxy(proxy or "")
     low_mode = str(low).lower() in ("1", "true", "yes")
-    return await _run_check(site_val, card_val, proxy_val, low_mode)
+    result = await _run_check(site_val, card_val, proxy_val, low_mode)
+    return JSONResponse(content=result)
 
 
 @app.get("/check")
 async def check_get(
     card: str = Query(...),
     url: str = Query(...),
-    proxy: str = Query(...),
+    proxy: str = Query(None),
     low: str = Query("true"),
 ):
     site_val = url if url.startswith("http") else "https://" + url
-    try:
-        proxy_val = _norm_proxy(proxy)
-    except Exception as e:
-        return JSONResponse(_stamp({"Response": "ERROR", "Status": False, "error": str(e), "cc": card, "Gateway": "Shopify", "Price": "-"}))
-    return await _run_check(site_val, card.strip(), proxy_val, str(low).lower() in ("1", "true", "yes"))
+    proxy_val = _norm_proxy(proxy or "")
+    result = await _run_check(
+        site_val,
+        card.strip(),
+        proxy_val,
+        str(low).lower() in ("1", "true", "yes"),
+    )
+    return JSONResponse(content=result)
 
 
 @app.post("/check")
@@ -291,19 +317,26 @@ async def check_get(
 async def check_post(body: CheckBody):
     card_val = (body.cc or body.card or "").strip()
     site_val = (body.site or body.shop_url or body.url or "").strip()
+    if not card_val:
+        return JSONResponse(status_code=400, content=_stamp({
+            "Response": "ERROR", "Status": False,
+            "error": "card required", "Gateway": "Shopify", "Price": "-",
+        }))
+    if not site_val:
+        return JSONResponse(status_code=400, content=_stamp({
+            "Response": "ERROR", "Status": False,
+            "error": "site required", "Gateway": "Shopify", "Price": "-",
+        }))
     if not site_val.startswith("http"):
         site_val = "https://" + site_val
-    try:
-        proxy_val = _norm_proxy(body.proxy or "")
-    except Exception as e:
-        return JSONResponse(_stamp({"Response": "ERROR", "Status": False, "error": str(e), "cc": card_val, "Gateway": "Shopify", "Price": "-"}))
-    return await _run_check(site_val, card_val, proxy_val, body.low)
+    proxy_val = _norm_proxy(body.proxy or "")
+    result = await _run_check(site_val, card_val, proxy_val, body.low)
+    return JSONResponse(content=result)
 
 
-# Vercel / ASGI entrypoints
-# Vercel Python looks for `app` (ASGI) or `handler`
+# Vercel ASGI entrypoint
 try:
     from mangum import Mangum
     handler = Mangum(app, lifespan="off")
-except Exception as _e:
-    handler = app  # fallback: some runtimes accept raw ASGI app
+except ImportError:
+    handler = app
