@@ -61,17 +61,23 @@ class CheckBody(BaseModel):
 
 
 def _norm_proxy(raw: str) -> str:
-    if not raw:
-        raise ValueError("proxy required")
+    """Optional proxy. Empty string = direct (no proxy)."""
+    if not raw or not str(raw).strip():
+        return ""
     if normalize_proxy:
-        return normalize_proxy(raw)
-    p = raw.strip()
+        try:
+            return normalize_proxy(raw)
+        except Exception:
+            pass
+    p = str(raw).strip()
     if p.startswith("http://") or p.startswith("https://") or p.startswith("socks"):
         return p
     parts = p.split(":")
     if len(parts) == 4:
         host, port, user, pwd = parts
         return f"http://{user}:{pwd}@{host}:{port}"
+    if len(parts) == 2:
+        return f"http://{p}"
     return f"http://{p}"
 
 
@@ -140,6 +146,21 @@ def _run_sync(shop_url: str, card: str, proxy: str, low: bool) -> dict:
                     time.sleep(0.3)
                     continue
 
+            # Classify proxy failures from engine error text
+            elow = (err or "").lower()
+            if any(x in elow for x in ("402", "connect tunnel", "curl: (7)", "tunnel failed", "proxy error")):
+                return {
+                    "Response": "PROXY_ERROR",
+                    "RawResponse": status_code or "PROXY_ERROR",
+                    "Status": False,
+                    "Gateway": "Shopify Payments",
+                    "Price": "-",
+                    "cc": card,
+                    "Site": shop_url,
+                    "error": "Proxy dead/402 — use fresh proxy or call without proxy",
+                    "retryable": True,
+                    "receipt_url": "",
+                }
             return {
                 "Response": resp_txt,
                 "RawResponse": status_code,
@@ -153,10 +174,22 @@ def _run_sync(shop_url: str, card: str, proxy: str, low: bool) -> dict:
                 "receipt_url": data.get("receipt_url") or "",
             }
         except Exception as e:
-            last = str(e)[:200]
+            last = str(e)[:300]
+            low = last.lower()
             if attempt < MAX_RETRIES:
-                time.sleep(0.3)
+                time.sleep(0.2)
                 continue
+            # Clear proxy-dead messages
+            if any(x in low for x in ("402", "connect tunnel", "proxy", "curl: (7)", "curl: (56)", "tunnel failed")):
+                return {
+                    "Response": "PROXY_ERROR",
+                    "Status": False,
+                    "Gateway": "Shopify",
+                    "Price": "-",
+                    "cc": card,
+                    "error": "Proxy dead/402 — use fresh proxy or omit proxy",
+                    "retryable": True,
+                }
             return {
                 "Response": "ERROR",
                 "Status": False,
@@ -233,13 +266,7 @@ async def shopify_get(
         return JSONResponse(_stamp({"Response": "ERROR", "Status": False, "error": "site required", "Gateway": "Shopify", "Price": "-", "cc": card_val}))
     if not site_val.startswith("http"):
         site_val = "https://" + site_val
-    try:
-        proxy_val = _norm_proxy(proxy or "")
-    except Exception as e:
-        return JSONResponse(_stamp({
-            "Response": "ERROR", "Status": False, "error": f"proxy: {e}",
-            "Gateway": "Shopify", "Price": "-", "cc": card_val,
-        }))
+    proxy_val = _norm_proxy(proxy or "")
     low_mode = str(low).lower() in ("1", "true", "yes")
     return await _run_check(site_val, card_val, proxy_val, low_mode)
 
@@ -273,9 +300,10 @@ async def check_post(body: CheckBody):
     return await _run_check(site_val, card_val, proxy_val, body.low)
 
 
-# Vercel serverless entry (Mangum)
+# Vercel / ASGI entrypoints
+# Vercel Python looks for `app` (ASGI) or `handler`
 try:
     from mangum import Mangum
     handler = Mangum(app, lifespan="off")
-except Exception:
-    handler = None
+except Exception as _e:
+    handler = app  # fallback: some runtimes accept raw ASGI app
